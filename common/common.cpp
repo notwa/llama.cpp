@@ -383,6 +383,13 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
             }
             sparams.temp = std::stof(argv[i]);
             sparams.temp = std::max(sparams.temp, 0.0f);
+        } else if (arg == "--dynatemp") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            sparams.dynatemp_range = std::stof(argv[i]);
+            sparams.dynatemp_range = std::max(sparams.dynatemp_range, 0.0f);
         } else if (arg == "--tfs") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -1061,6 +1068,7 @@ void gpt_print_usage(int /*argc*/, char ** argv, const gpt_params & params) {
     printf("  --ignore-eos          ignore end of stream token and continue generating (implies --logit-bias 2-inf)\n");
     printf("  --no-penalize-nl      do not penalize newline token\n");
     printf("  --temp N              temperature (default: %.1f)\n", (double)sparams.temp);
+    printf("  --dynatemp N          dynamic temperature range (default: %.1f)\n", (double)sparams.dynatemp_range);
     printf("  --all-logits          return logits for all tokens in the batch (default: disabled)\n");
     printf("  --hellaswag           compute HellaSwag score over random tasks from datafile supplied with -f\n");
     printf("  --hellaswag-tasks N   number of tasks to use when computing the HellaSwag score (default: %zu)\n", params.hellaswag_tasks);
@@ -1832,6 +1840,7 @@ void dump_non_result_info_yaml(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "simple_io: %s # default: false\n", params.simple_io ? "true" : "false");
     fprintf(stream, "cont_batching: %s # default: false\n", params.cont_batching ? "true" : "false");
     fprintf(stream, "temp: %f # default: 0.8\n", sparams.temp);
+    fprintf(stream, "dynatemp_range: %f # default: 0.8\n", sparams.dynatemp_range);
 
     const std::vector<float> tensor_split_vector(params.tensor_split, params.tensor_split + llama_max_devices());
     dump_vector_float_yaml(stream, "tensor_split", tensor_split_vector);
