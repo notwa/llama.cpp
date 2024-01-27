@@ -9560,55 +9560,61 @@ static void llama_model_fixup_internal(const std::string & fname_inp, const std:
     }
 
     {
-        int str_data_key = -1;
-        int int_data_key = -1;
+        bool dirty_str_data = false;
+        bool dirty_int_data = false;
+        int32_t new_eos_token = -1;
         std::vector<std::string> new_str_data;
         std::vector<int32_t> new_int_data;
         std::map<int, llama_token_type> token_type_overrides;
+
+        const auto kv = LLM_KV(model.arch);
+        const char * token_list_key = kv(LLM_KV_TOKENIZER_LIST).c_str();
+        const char * token_type_key = kv(LLM_KV_TOKENIZER_TOKEN_TYPE).c_str();
+        const char * eos_token_key = kv(LLM_KV_TOKENIZER_EOS_ID).c_str();
 
         int n_kv = gguf_get_n_kv(ml.ctx_gguf);
         for (int i = 0; i < n_kv; i++) {
             const char * name           = gguf_get_key(ml.ctx_gguf, i);
             const enum gguf_type type   = gguf_get_kv_type(ml.ctx_gguf, i);
-            if (type == GGUF_TYPE_ARRAY && strcmp(name, "tokenizer.ggml.tokens") == 0) {
+            if (type == GGUF_TYPE_ARRAY && strcmp(name, token_list_key) == 0) {
                 const enum gguf_type arr_type = gguf_get_arr_type(ml.ctx_gguf, i);
                 if (arr_type == GGUF_TYPE_STRING) {
-                    str_data_key = i;
                     int arr_n = gguf_get_arr_n(ml.ctx_gguf, i);
                     new_str_data.reserve(arr_n);
                     for (int j = 0; j < arr_n; j++) {
                         std::string val = gguf_get_arr_str(ml.ctx_gguf, i, j);
+                        std::string new_val;
                         int unused_token_i = -1;
                         if (sscanf(val.c_str(), "[UNUSED_TOKEN_%d]", &unused_token_i) == 1) {
-                            //LLAMA_LOG_INFO("found an unused token! it's [UNUSED_TOKEN_%i]\n", unused_token_i);
-                            bool found = false;
                             switch (unused_token_i) {
-                                case 141: val = "<|plugin|>"; found = true; break;
-                                case 142: val = "<|interpreter|>"; found = true; break;
-                                case 143: val = "<|action_end|>"; found = true; break;
-                                case 144: val = "<|action_start|>"; found = true; break;
-                                case 145: val = "<|im_end|>"; found = true; break;
-                                case 146: val = "<|im_start|>"; found = true; break;
+                                case 141: new_val = "<|plugin|>"; break;
+                                case 142: new_val = "<|interpreter|>"; break;
+                                case 143: new_val = "<|action_end|>"; break;
+                                case 144: new_val = "<|action_start|>"; break;
+                                case 145: new_val = "<|im_end|>"; new_eos_token = j; break;
+                                case 146: new_val = "<|im_start|>"; break;
                             }
-                            if (found) {
+                            if (new_val.size() > 0) {
+                                LLAMA_LOG_INFO("%s: remapping token \"%s\" => \"%s\"\n", __func__, val.c_str(), new_val.c_str());
                                 token_type_overrides.emplace(j, LLAMA_TOKEN_TYPE_CONTROL);
+                                dirty_str_data = true;
                             }
                         }
-                        new_str_data.emplace_back(val);
+                        new_str_data.emplace_back(new_val.size() > 0 ? new_val : val);
                     }
                 }
 
-            } else if (type == GGUF_TYPE_ARRAY && strcmp(name, "tokenizer.ggml.token_type") == 0) {
+            } else if (type == GGUF_TYPE_ARRAY && strcmp(name, token_type_key) == 0) {
                 const enum gguf_type arr_type = gguf_get_arr_type(ml.ctx_gguf, i);
                 if (arr_type == GGUF_TYPE_INT32) {
                     const int32_t * data = (const int32_t *)gguf_get_arr_data(ml.ctx_gguf, i);
                     int arr_n = gguf_get_arr_n(ml.ctx_gguf, i);
-                    int_data_key = i;
                     new_int_data.reserve(arr_n);
                     for (int j = 0; j < arr_n; j++) {
                         if (token_type_overrides.find(j) != token_type_overrides.end()) {
-                            //LLAMA_LOG_INFO("found a token type override!\n");
+                            LLAMA_LOG_INFO("%s: rewriting token type %i => %i\n", __func__, data[j], token_type_overrides[j]);
                             new_int_data.emplace_back(token_type_overrides[j]);
+                            dirty_int_data = true;
                         } else {
                             new_int_data.emplace_back(data[j]);
                         }
@@ -9624,11 +9630,14 @@ static void llama_model_fixup_internal(const std::string & fname_inp, const std:
             new_cstr_data.emplace_back(new_str_data[i].c_str());
         }
 
-        if (str_data_key >= 0) {
-            gguf_set_arr_str(ctx_out, "tokenizer.ggml.tokens", new_cstr_data.data(), new_str_size);
+        if (dirty_str_data) {
+            gguf_set_arr_str(ctx_out, token_list_key, new_cstr_data.data(), new_str_size);
         }
-        if (int_data_key >= 0) {
-            gguf_set_arr_data(ctx_out, "tokenizer.ggml.token_type", GGUF_TYPE_INT32, new_int_data.data(), new_int_data.size());
+        if (dirty_int_data) {
+            gguf_set_arr_data(ctx_out, token_type_key, GGUF_TYPE_INT32, new_int_data.data(), new_int_data.size());
+        }
+        if (new_eos_token >= 0) {
+            gguf_set_val_u32(ctx_out, eos_token_key, new_eos_token);
         }
     }
 
