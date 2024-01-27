@@ -9568,15 +9568,15 @@ static void llama_model_fixup_internal(const std::string & fname_inp, const std:
         std::map<int, llama_token_type> token_type_overrides;
 
         const auto kv = LLM_KV(model.arch);
-        const char * token_list_key = kv(LLM_KV_TOKENIZER_LIST).c_str();
-        const char * token_type_key = kv(LLM_KV_TOKENIZER_TOKEN_TYPE).c_str();
-        const char * eos_token_key = kv(LLM_KV_TOKENIZER_EOS_ID).c_str();
+        const std::string token_list_key = kv(LLM_KV_TOKENIZER_LIST);
+        const std::string token_type_key = kv(LLM_KV_TOKENIZER_TOKEN_TYPE);
+        const std::string eos_token_key = kv(LLM_KV_TOKENIZER_EOS_ID);
 
         int n_kv = gguf_get_n_kv(ml.ctx_gguf);
         for (int i = 0; i < n_kv; i++) {
             const char * name           = gguf_get_key(ml.ctx_gguf, i);
             const enum gguf_type type   = gguf_get_kv_type(ml.ctx_gguf, i);
-            if (type == GGUF_TYPE_ARRAY && strcmp(name, token_list_key) == 0) {
+            if (type == GGUF_TYPE_ARRAY && strcmp(name, token_list_key.c_str()) == 0) {
                 const enum gguf_type arr_type = gguf_get_arr_type(ml.ctx_gguf, i);
                 if (arr_type == GGUF_TYPE_STRING) {
                     int arr_n = gguf_get_arr_n(ml.ctx_gguf, i);
@@ -9604,7 +9604,7 @@ static void llama_model_fixup_internal(const std::string & fname_inp, const std:
                     }
                 }
 
-            } else if (type == GGUF_TYPE_ARRAY && strcmp(name, token_type_key) == 0) {
+            } else if (type == GGUF_TYPE_ARRAY && strcmp(name, token_type_key.c_str()) == 0) {
                 const enum gguf_type arr_type = gguf_get_arr_type(ml.ctx_gguf, i);
                 if (arr_type == GGUF_TYPE_INT32) {
                     const int32_t * data = (const int32_t *)gguf_get_arr_data(ml.ctx_gguf, i);
@@ -9630,14 +9630,17 @@ static void llama_model_fixup_internal(const std::string & fname_inp, const std:
             new_cstr_data.emplace_back(new_str_data[i].c_str());
         }
 
+        //GGML_ASSERT(dirty_str_data);
+        //GGML_ASSERT(dirty_int_data);
+        //GGML_ASSERT(new_eos_token >= 0);
         if (dirty_str_data) {
-            gguf_set_arr_str(ctx_out, token_list_key, new_cstr_data.data(), new_str_size);
+            gguf_set_arr_str(ctx_out, token_list_key.c_str(), new_cstr_data.data(), new_str_size);
         }
         if (dirty_int_data) {
-            gguf_set_arr_data(ctx_out, token_type_key, GGUF_TYPE_INT32, new_int_data.data(), new_int_data.size());
+            gguf_set_arr_data(ctx_out, token_type_key.c_str(), GGUF_TYPE_INT32, new_int_data.data(), new_int_data.size());
         }
         if (new_eos_token >= 0) {
-            gguf_set_val_u32(ctx_out, eos_token_key, new_eos_token);
+            gguf_set_val_u32(ctx_out, eos_token_key.c_str(), new_eos_token);
         }
     }
 
