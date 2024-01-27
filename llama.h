@@ -386,6 +386,11 @@ extern "C" {
             const char * fname_out,
             const llama_model_quantize_params * params);
 
+    // Returns 0 on success
+    LLAMA_API uint32_t llama_model_fixup(
+            const char * fname_inp,
+            const char * fname_out);
+
     // Apply a LoRA adapter to a loaded model
     // path_base_model is the path to a higher quality model to use as a base for
     // the layers modified by the adapter. Can be NULL to use the current loaded model.

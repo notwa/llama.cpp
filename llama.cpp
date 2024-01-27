@@ -9467,6 +9467,268 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     }
 }
 
+static void llama_model_fixup_internal(const std::string & fname_inp, const std::string & fname_out) {
+    // Use the same conditions as llama_model_quantize_internal.
+#if defined(__linux__) || defined(_WIN32)
+    constexpr bool use_mmap = true;
+#else
+    constexpr bool use_mmap = false;
+#endif
+
+    llama_model_loader ml(fname_inp, use_mmap, NULL);
+    ml.init_mapping(false); // no prefetching?
+
+    llama_model model;
+    llm_load_arch(ml, model);
+    llm_load_hparams(ml, model);
+
+    llama_ftype ftype = model.ftype;
+
+    const size_t align = GGUF_DEFAULT_ALIGNMENT;
+    struct gguf_context * ctx_out = gguf_init_empty();
+
+    // copy the KV pairs from the input file
+    gguf_set_kv     (ctx_out, ml.ctx_gguf);
+    gguf_set_val_u32(ctx_out, "general.quantization_version", GGML_QNT_VERSION);
+    gguf_set_val_u32(ctx_out, "general.file_type", ftype);
+
+    if (0) {
+        struct gguf_context * ctx_gguf = ml.ctx_gguf;
+        int n_kv      = gguf_get_n_kv(ctx_gguf);
+        for (int i = 0; i < n_kv; i++) {
+            const char * name           = gguf_get_key(ctx_gguf, i);
+            const enum gguf_type type   = gguf_get_kv_type(ctx_gguf, i);
+            const std::string type_name =
+                type == GGUF_TYPE_ARRAY
+                ? format("%s[%s,%d]", gguf_type_name(type), gguf_type_name(gguf_get_arr_type(ctx_gguf, i)), gguf_get_arr_n(ctx_gguf, i))
+                : gguf_type_name(type);
+
+            std::string value;
+            switch (type) {
+                case GGUF_TYPE_STRING:
+                    value = gguf_get_val_str(ctx_gguf, i);
+                    break;
+                case GGUF_TYPE_ARRAY:
+                    {
+                        const enum gguf_type arr_type = gguf_get_arr_type(ctx_gguf, i);
+                        int arr_n = gguf_get_arr_n(ctx_gguf, i);
+                        const void * data = gguf_get_arr_data(ctx_gguf, i);
+                        std::stringstream ss;
+                        ss << "[";
+                        for (int j = 0; j < arr_n; j++) {
+                            if (arr_type == GGUF_TYPE_STRING) {
+                                std::string val = gguf_get_arr_str(ctx_gguf, i, j);
+                                ss << "\n  \"";
+                                char buffer[5]; // enough to hold '\\','1','2','3','\0'
+                                for (int k = 0; k < (int) val.length(); k++) {
+                                    unsigned char c = val[k];
+                                    if (c < 32 || c > 126) { // unprintable ASCII
+                                        snprintf(buffer, 5, "\\%03o", c);
+                                        ss << buffer;
+                                    } else if (c == '\"' || c == '\\') {
+                                        buffer[0] = '\\';
+                                        buffer[1] = c;
+                                        buffer[2] = '\0';
+                                        ss << buffer;
+                                    } else {
+                                        ss << (char) c;
+                                    }
+                                }
+                                ss << '"';
+                            } else if (arr_type == GGUF_TYPE_ARRAY) {
+                                ss << " ???";
+                            } else {
+                                ss << " " << gguf_data_to_str(arr_type, data, j);
+                            }
+                            if (j < arr_n - 1) {
+                                ss << ",";
+                                if ((j + 1) % 10 == 0) {
+                                    ss << "\n";
+                                }
+                            }
+                        }
+                        ss << "\n]";
+                        value = ss.str();
+                    }
+                    break;
+                default:
+                    value = gguf_data_to_str(type, gguf_get_val_data(ctx_gguf, i), 0);
+            }
+
+            LLAMA_LOG_INFO("- kv %3d: %42s %-16s = %s\n", i, name, type_name.c_str(), value.c_str());
+        }
+    }
+
+    {
+        int str_data_key = -1;
+        int int_data_key = -1;
+        std::vector<std::string> new_str_data;
+        std::vector<int32_t> new_int_data;
+        std::map<int, llama_token_type> token_type_overrides;
+
+        int n_kv = gguf_get_n_kv(ml.ctx_gguf);
+        for (int i = 0; i < n_kv; i++) {
+            const char * name           = gguf_get_key(ml.ctx_gguf, i);
+            const enum gguf_type type   = gguf_get_kv_type(ml.ctx_gguf, i);
+            if (type == GGUF_TYPE_ARRAY && strcmp(name, "tokenizer.ggml.tokens") == 0) {
+                const enum gguf_type arr_type = gguf_get_arr_type(ml.ctx_gguf, i);
+                if (arr_type == GGUF_TYPE_STRING) {
+                    str_data_key = i;
+                    int arr_n = gguf_get_arr_n(ml.ctx_gguf, i);
+                    new_str_data.reserve(arr_n);
+                    for (int j = 0; j < arr_n; j++) {
+                        std::string val = gguf_get_arr_str(ml.ctx_gguf, i, j);
+                        int unused_token_i = -1;
+                        if (sscanf(val.c_str(), "[UNUSED_TOKEN_%d]", &unused_token_i) == 1) {
+                            //LLAMA_LOG_INFO("found an unused token! it's [UNUSED_TOKEN_%i]\n", unused_token_i);
+                            bool found = false;
+                            switch (unused_token_i) {
+                                case 141: val = "<|plugin|>"; found = true; break;
+                                case 142: val = "<|interpreter|>"; found = true; break;
+                                case 143: val = "<|action_end|>"; found = true; break;
+                                case 144: val = "<|action_start|>"; found = true; break;
+                                case 145: val = "<|im_end|>"; found = true; break;
+                                case 146: val = "<|im_start|>"; found = true; break;
+                            }
+                            if (found) {
+                                token_type_overrides.emplace(j, LLAMA_TOKEN_TYPE_CONTROL);
+                            }
+                        }
+                        new_str_data.emplace_back(val);
+                    }
+                }
+
+            } else if (type == GGUF_TYPE_ARRAY && strcmp(name, "tokenizer.ggml.token_type") == 0) {
+                const enum gguf_type arr_type = gguf_get_arr_type(ml.ctx_gguf, i);
+                if (arr_type == GGUF_TYPE_INT32) {
+                    const int32_t * data = (const int32_t *)gguf_get_arr_data(ml.ctx_gguf, i);
+                    int arr_n = gguf_get_arr_n(ml.ctx_gguf, i);
+                    int_data_key = i;
+                    new_int_data.reserve(arr_n);
+                    for (int j = 0; j < arr_n; j++) {
+                        if (token_type_overrides.find(j) != token_type_overrides.end()) {
+                            //LLAMA_LOG_INFO("found a token type override!\n");
+                            new_int_data.emplace_back(token_type_overrides[j]);
+                        } else {
+                            new_int_data.emplace_back(data[j]);
+                        }
+                    }
+                }
+            }
+        }
+
+        const std::string::size_type new_str_size = new_str_data.size();
+        std::vector<const char *> new_cstr_data;
+        new_cstr_data.reserve(new_str_size);
+        for (std::string::size_type i = 0; i < new_str_size; i++) {
+            new_cstr_data.emplace_back(new_str_data[i].c_str());
+        }
+
+        if (str_data_key >= 0) {
+            gguf_set_arr_str(ctx_out, "tokenizer.ggml.tokens", new_cstr_data.data(), new_str_size);
+        }
+        if (int_data_key >= 0) {
+            gguf_set_arr_data(ctx_out, "tokenizer.ggml.token_type", GGUF_TYPE_INT32, new_int_data.data(), new_int_data.size());
+        }
+    }
+
+    size_t total_size_org = 0;
+    size_t total_size_new = 0;
+    std::vector<int64_t> hist_all(1 << 4, 0);
+
+    int idx = 0;
+
+    std::vector<no_init<uint8_t>> read_data;
+    std::vector<no_init<uint8_t>> work;
+    std::vector<no_init<float>> f32_conv_buf;
+
+    // populate the original tensors so we get an initial meta data
+    for (int i = 0; i < ml.n_tensors; ++i) {
+        struct ggml_tensor * meta = ml.get_tensor_meta(i);
+        gguf_add_tensor(ctx_out, meta);
+    }
+
+    std::ofstream fout(fname_out, std::ios::binary);
+    fout.exceptions(std::ofstream::failbit); // fail fast on write errors
+
+    const size_t meta_size = gguf_get_meta_size(ctx_out);
+
+    LLAMA_LOG_INFO("%s: meta size = %zu bytes\n", __func__, meta_size);
+
+    // placeholder for the meta data
+    ::zeros(fout, meta_size);
+
+    for (int i = 0; i < ml.n_tensors; ++i) {
+        struct ggml_tensor * tensor = ml.get_tensor_meta(i);
+
+        const std::string name = ggml_get_name(tensor);
+
+        if (!ml.use_mmap) {
+            if (read_data.size() < ggml_nbytes(tensor)) {
+                read_data.resize(ggml_nbytes(tensor));
+            }
+            tensor->data = read_data.data();
+        }
+        ml.load_data_for(tensor);
+
+        LLAMA_LOG_INFO("[%4d/%4d] %36s - [%s], type = %6s, ",
+               ++idx, ml.n_tensors,
+               ggml_get_name(tensor),
+               llama_format_tensor_shape(tensor).c_str(),
+               ggml_type_name(tensor->type));
+
+        enum ggml_type new_type;
+        void * new_data;
+        size_t new_size;
+
+        new_type = tensor->type;
+        new_data = tensor->data;
+        new_size = ggml_nbytes(tensor);
+        LLAMA_LOG_INFO("size = %8.3f MB\n", ggml_nbytes(tensor)/1024.0/1024.0);
+        total_size_org += ggml_nbytes(tensor);
+        total_size_new += new_size;
+
+        // update the gguf meta data as we go
+        gguf_set_tensor_type(ctx_out, name.c_str(), new_type);
+        gguf_set_tensor_data(ctx_out, name.c_str(), new_data, new_size);
+
+        // write tensor data + padding
+        fout.write((const char *) new_data, new_size);
+        zeros(fout, GGML_PAD(new_size, align) - new_size);
+    }
+
+    // go back to beginning of file and write the updated meta data
+    {
+        fout.seekp(0);
+        std::vector<uint8_t> data(gguf_get_meta_size(ctx_out));
+        gguf_get_meta_data(ctx_out, data.data());
+        fout.write((const char *) data.data(), data.size());
+    }
+
+    fout.close();
+
+    gguf_free(ctx_out);
+
+    LLAMA_LOG_INFO("%s: model size  = %8.2f MB\n", __func__, total_size_org/1024.0/1024.0);
+    LLAMA_LOG_INFO("%s: quant size  = %8.2f MB\n", __func__, total_size_new/1024.0/1024.0);
+
+    // print histogram for all tensors
+    {
+        int64_t sum_all = 0;
+        for (size_t i = 0; i < hist_all.size(); i++) {
+            sum_all += hist_all[i];
+        }
+
+        if (sum_all > 0) {
+            LLAMA_LOG_INFO("%s: hist: ", __func__);
+            for (size_t i = 0; i < hist_all.size(); i++) {
+                LLAMA_LOG_INFO("%5.3f ", hist_all[i] / float(sum_all));
+            }
+            LLAMA_LOG_INFO("\n");
+        }
+    }
+}
+
 static int llama_apply_lora_from_file_internal(
     const struct llama_model & model, const char * path_lora, float scale, const char * path_base_model, int n_threads
 ) {
@@ -10243,6 +10505,18 @@ uint32_t llama_model_quantize(
         return 0;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to quantize: %s\n", __func__, err.what());
+        return 1;
+    }
+}
+
+uint32_t llama_model_fixup(
+        const char * fname_inp,
+        const char * fname_out) {
+    try {
+        llama_model_fixup_internal(fname_inp, fname_out);
+        return 0;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to fixup: %s\n", __func__, err.what());
         return 1;
     }
 }
