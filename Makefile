@@ -485,7 +485,13 @@ endif # LLAMA_CLBLAST
 
 ifdef LLAMA_VULKAN
 	MK_CPPFLAGS  += -DGGML_USE_VULKAN
-	MK_LDFLAGS += -lvulkan
+
+	# MSYS2 has a different name for its Vulkan library
+	ifneq (${MSYSTEM},)
+		MK_LDFLAGS += -lvulkan-1
+	else
+		MK_LDFLAGS += -lvulkan
+	endif
 	OBJS    += ggml-vulkan.o
 
 ifdef LLAMA_VULKAN_CHECK_RESULTS
