@@ -989,7 +989,7 @@ class OutputFile:
     def add_meta_arch(self, params: Params) -> None:
         # TODO: better logic to determine model name
         if params.path_model is not None:
-            name = params.path_model>name
+            name = params.path_model.name
         elif params.n_ctx == 4096:
             name = "LLaMA v2"
         else:
